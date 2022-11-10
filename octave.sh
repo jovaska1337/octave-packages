@@ -28,7 +28,7 @@ output="${repositories}/octave"
 # ebuild category for generated ebuilds
 category="octave-packages"
 
-# "builtin" packages (these don't resolve as a dependency)
+# "builtin" octave packages (these don't resolve as a dependency)
 declare -a octave_builtin
 # the pkg package manager is built into octave
 octave_builtin+=(pkg)
@@ -38,14 +38,14 @@ octave_builtin+=(odepkg)
 
 # packages to ignore from the repository
 # (ie. ebuilds won't be created for these)
-declare -a ignore_packages
+declare -a octave_ignore
 # this is already built into octave
-ignore_packages+=(pkg)
+octave_ignore+=(pkg)
 # as portage now handles the octave package
 # management, I see no reason to include this
-ignore_packages+=(packajoozle)
+octave_ignore+=(packajoozle)
 # example package, no need for an ebuild
-ignore_packages+=(pkg-example)
+octave_ignore+=(pkg-example)
 
 # static translation rules for library names
 # ('lib' prefix and '-dev' suffix removed)
@@ -57,7 +57,7 @@ static_rules[sqlite3]="dev-db/sqlite"
 static_rules[zmq]="net-libs/zeromq"
 static_rules[pq]="dev-db/postgresql"
 
-# extra dependencies per package
+# extra dependencies to add per package
 declare -A extra_depends
 # this is outright missing from the dependencies
 extra_depends[fits]="sci-libs/cfitsio"
@@ -65,12 +65,10 @@ extra_depends[fits]="sci-libs/cfitsio"
 # dependency. doesn't work with >=sympy-1.6 at all
 # (this is what you get when the devs use LTS distros)
 extra_depends[symbolic]=">dev-python/sympy-1.6"
-
-# FIXME: required octave useflags for packages should be
-# collected here. for example image-aquisition requires
-# fltk which is pulled in by octave when USE=opengl
-declare -A required_use
-required_use[image-aquisition]="opengl"
+# force USE=sundials to enable all ODE solvers
+extra_depends[odepkg]="sci-mathematics/octave[sundials]"
+# force USE=opengl to pull in fltk
+extra_depends[image-aquisition]="sci-mathematics/octave[opengl]"
 
 # gawk program to parse the index
 read -r -d '' gawk_program << EOF
@@ -92,26 +90,6 @@ read -r -d '' gawk_program << EOF
 		print m[1] " \"" m[2] "\" " m[3]
 	}
 }
-EOF
-
-# /etc/portage/repos.conf/octave.conf
-read -r -d '' repo_conf <<EOF
-[octave]
-location = ${output}
-masters = gentoo
-EOF
-
-# eclass/octave.eclass
-read -r -d '' octave_eclass << EOF
-# under development
-EOF
-
-# metadata/layout.conf
-read -r -d '' layout_conf << EOF
-# layout.conf
-masters = gentoo
-sign-commits = false
-sign-manifests = false
 EOF
 
 # object creator
@@ -526,36 +504,51 @@ split_atom() {
 	local n
 	local op
 	local ver
-	local tmp
+	local _tmp
+	local use
 
 	# array reference
 	local -n out="$1"
 
 	# version operator
-	tmp="$2"
-	if [[ "$2" =~ ^([=\<\>]+)(.*) ]]; then
+	_tmp="$2"
+	if [[ "$2" =~ ^([=\<\>]+) ]]; then
 		op="${BASH_REMATCH[1]}"
-		tmp="${BASH_REMATCH[2]}"
+		n="${#op}"
+		_tmp="${_tmp:$n}"
+	fi
+
+	# useflags
+	if [[ "$_tmp" =~ \[([^\[]+)\]$ ]]; then
+		use="${BASH_REMATCH[1]}"
+		n=$((${#_tmp} - ${#use} - 2))
+		_tmp="${_tmp:0:$n}"
 	fi
 
 	# package version
 	# this regex is trash, because my bash
 	# is apparently unable to use word boundaries
-	if [[ "$tmp" =~ (^|[^[:alnum:]=\<\>~.])([0-9][0-9.-]*)$ ]]; then
+	if [[ "$_tmp" =~ (^|[^[:alnum:]=\<\>~.])([0-9][0-9.-]*)$ ]]; then
 		ver="${BASH_REMATCH[2]}"
 	fi
 
 	# package name
 	if [[ "$ver" ]]; then 
-		n=$((${#tmp} - ${#ver} - 1))
+		n=$((${#_tmp} - ${#ver} - 1))
 		[[ "$n" -lt 0 ]] \
-			&& unset tmp \
-			|| tmp="${tmp:0:$n}"
+			&& _tmp="" \
+			|| _tmp="${_tmp:0:$n}"
 	fi
 
 	out+=("$op")
-	out+=("$tmp")
+	out+=("$_tmp")
 	out+=("$ver")
+
+	IFS=, read -a use <<< "$use"
+	for _tmp in "${use[@]}"; do
+		IFS=' ' read -a _tmp <<< "$_tmp"
+		out+=("${_tmp[0]}")
+	done
 }
 
 # comprare package versions
@@ -623,16 +616,21 @@ shortest() {
 	echo "$out"
 }
 
-# combine multiple atoms of the same package into
-# the most specific one while considering versions
+# combine multiple atoms of the same package into the most
+# specific one while considering versions and useflags
+# two atoms may be returned for the same package, if the
+# version range is unable to be combined
 prune_atoms() {
 	# local variables
 	local op
 	local out
 	local key
-	local val
+	local use
+	local tmp
+	local _min
+	local _max
+	local _use
 	local atom
-	local split
 
 	# array reference
 	local -n input="$1"
@@ -643,25 +641,52 @@ prune_atoms() {
 	# process atoms
 	for atom in "${input[@]}"; do
 		# split atom
-		split=()
-		split_atom split "$atom"
+		tmp=()
+		split_atom tmp "$atom"
 
 		# expand result
-		op="${split[0]}"
-		key="${split[1]}"
-		ver="${split[2]}"
+		op="${tmp[0]}"
+		key="${tmp[1]}"
+		ver="${tmp[2]}"
+		use=("${tmp[@]:3}")
 
-		# stored value of format
-		# [op]minversion,[op]maxversion
-		# (either version can be omitted)
-		IFS=, read -a val <<< "${map[$key]}"
+		# stored value is of format
+		# [op]minversion;[op]maxversion;useflags
+		# (any field may be omitted)
+		IFS=\; read -a tmp <<< "${map[$key]}"
+		_min="${tmp[0]}"
+		_max="${tmp[1]}"
+		_use="${tmp[2]}"
+		IFS=, read -a _use <<< "$_use"
+
+		# use hashmap keys for useflags
+		# (more efficient than two nested for loops)
+		local -A usemap=()
+		for tmp in "${_use[@]}"; do
+			usemap["$tmp"]=''
+		done
+
+		# add useflags
+		for tmp in "${use[@]}"; do
+			usemap["$tmp"]=''
+		done
+
+		# recombine to _use
+		_use=''
+		for tmp in "${!usemap[@]}"; do
+			_use="${_use},${tmp}"
+		done
+		_use="${_use##,}"
 
 		# store a zero minimum version initially
 		# as that will compare greater to all others
-		[[ "${#val[@]}" > 0 ]] || map["$key"]=">0,"
+		[[ "$_min" || "$_max" ]] || _min=">0"
 
 		# if the atom doesn't have a version, we stop here
-		[[ "$ver" ]] || continue
+		if [[ ! "$ver" ]]; then
+			map["$key"]="${_min};${_max};${_use}"
+			continue
+		fi
 
 		# if the version operator is missing, assume
 		# the specified value is a minimum version.
@@ -672,87 +697,117 @@ prune_atoms() {
 		# maximum version
 		if [[ "$op" == \<* ]]; then
 			# previous max version
-			if [[ "${val[1]}" ]]; then
+			if [[ "$_max" ]]; then
 				# split version and operator
-				split=()
-				split_atom split "${val[1]}"
+				tmp=()
+				split_atom tmp "$_max"
 
 				# compare versions
-				vercmp "$ver" "${split[2]}"
+				vercmp "$ver" "${tmp[2]}"
 				case "$?" in
 				# if versions are equal
 				# use the stricter operator
-				0) val[1]="$(shortest \
-					"$op" "${split[2]}")${ver}";;
+				0) _max="$(shortest \
+					"$op" "${tmp[0]}")${ver}";;
 
 				# if new version is smaller
 				# update the map to use it
-				1) val[1]="${op}${ver}";;
+				1) _max="${op}${ver}";;
 				esac
 			# just set this one
 			else
-				val[1]="${op}${ver}"
+				_max="${op}${ver}"
 			fi
 
 		# minimum version
 		elif [[ "$op" == \>* ]]; then
 			# previous min version
-			if [[ "${val[0]}" ]]; then
+			if [[ "$_min" ]]; then
 				# split version and operator
-				split=()
-				split_atom split "${val[0]}"
+				tmp=()
+				split_atom tmp "$_min"
 
 				# compare versions
-				vercmp "$ver" "${split[2]}"
+				vercmp "$ver" "${tmp[2]}"
 				case "$?" in
 				# if versions are equal
 				# use the stricter operator
-				0) val[0]="$(shortest \
-					"$op" "${split[2]}")${ver}";;
+				0) _min="$(shortest \
+					"$op" "${tmp[0]}")${ver}";;
 
 				# if new version is smaller
 				# update the map to use it
-				2) val[0]="${op}${ver}";;
+				2) _min="${op}${ver}";;
 				esac
 
 			# just set this one
 			else
-				val[0]="${op}${ver}"
+				_min="${op}${ver}"
 			fi
 		fi
 
 		# update value
-		map["$key"]="${val[0]},${val[1]}"
+		map["$key"]="${_min};${_max};${_use}"
 	done
 
 	# construct output
 	out=()
 	for key in "${!map[@]}"; do
 		# read stored value
-		IFS=, read -a val <<< "${map[$key]}"
+		IFS=\; read -a tmp <<< "${map[$key]}"
+		_min="${tmp[0]}"
+		_max="${tmp[1]}"
+		_use="${tmp[2]}"
 
-		# minimum version
-		if [[ "${val[0]}" ]]; then
-			# split version and operator
-			split=()
-			split_atom split "${val[0]}"
+		# split version info
+		tmp=()
+		split_atom tmp "$_min"
+		_min=("${tmp[@]}")
+		tmp=()
+		split_atom tmp "$_max"
+		_max=("${tmp[@]}")
 
+		# check if minimum version is 0
+		vercmp 0 "${_min[2]}"
+		tmp="$?"
+
+		# minimum and maximum versions
+		# (we could use the asterix postfix to
+		# simplify this to a single atom in some
+		# cases but it likely breaks others, thus
+		# we will always output two atoms here)
+		if [[ "$_min" && "$_max" && "$tmp" -ne 0 ]]; then
+			# min version with useflags
+			atom="${_min[0]}${key}-${_min[2]}"
+			[[ "$_use" ]] && atom="${atom}[${_use}]"
+			out+=("$atom")
+
+			# max version
+			atom="${_max[0]}${key}-${_max[2]}"
+			out+=("$atom")
+
+		# maximum version only
+		elif [[ "${_max[2]}" ]]; then
+			atom="${_max[0]}${key}-${_max[2]}"
+			[[ "$_use" ]] && atom="${atom}[${_use}]"
+			out+=("$atom")
+
+		# minimum version only
+		elif [[ "${_min[2]}" ]]; then
 			# if version is zero, discard version
 			# information from the package atom
-			vercmp 0 "${split[2]}"
-			[[ "$?" == 0 ]] \
-				&& out+=("${key}") \
-				|| out+=("${split[0]}${key}-${split[2]}")
-		fi
+			[[ "$tmp" == 0 ]] \
+				&& atom="${key}" \
+				|| atom="${_min[0]}${key}-${_min[2]}"
 
-		# maximum version
-		if [[ "${val[1]}" ]]; then
-			# split version and operator
-			split=()
-			split_atom split "${val[1]}"
+			[[ "$_use" ]] && atom="${atom}[${_use}]"
+			out+=("$atom")
 
-			# add to output
-			out+=("${split[0]}${key}-${split[2]}")
+		# no versioning
+		else
+			atom="${key}"
+			[[ "$_use" ]] && atom="${atom}[${_use}]"
+			out+=("$atom")
 		fi
 	done
 
@@ -863,59 +918,38 @@ main() {
 		return 1
 	fi
 
-	echo "Initializing repository..."
-
 	# add to /etc/portage/repos.conf/
-	tmp="/etc/portage/repos.conf/octave.conf"
-	if [[ -d "${tmp%/*}" ]]; then
-		if [[ ! -f "$tmp" || $(md5sum "$tmp" \
-			| cut -d\  -f1) != $(echo -n "$repo_conf" \
-				| md5sum | cut -d\  -f1) ]]; then
-			echo "Adding/modifying repository config..."
-			echo -n "$repo_conf" > "$tmp"
-			[[ "$?" != 0 ]] && echo "Failed, try running as root."
-		fi
-	fi
+	#tmp="/etc/portage/repos.conf/octave.conf"
+	#if [[ -d "${tmp%/*}" ]]; then
+	#	if [[ ! -f "$tmp" || $(md5sum "$tmp" \
+	#		| cut -d\  -f1) != $(echo -n "$repo_conf" \
+	#			| md5sum | cut -d\  -f1) ]]; then
+	#		echo "Adding/modifying repository config..."
+	#		echo -n "$repo_conf" > "$tmp"
+	#		[[ "$?" != 0 ]] && echo "Failed, try running as root."
+	#	fi
+	#fi
 
 	# add category to /etc/portage/categories
-	tmp="/etc/portage/categories"
-	grep "^${category}\$" "$tmp" &>/dev/null
-	if [[ "$?" != 0 ]]; then
-		echo "Adding ${category} to ${tmp}..."
-		echo "${category}" >> "$tmp"
-		[[ "$?" != 0 ]] && echo "Failed, try running as root."
-	fi
+	#tmp="/etc/portage/categories"
+	#grep "^${category}\$" "$tmp" &>/dev/null
+	#if [[ "$?" != 0 ]]; then
+	#	echo "Adding ${category} to ${tmp}..."
+	#	echo "${category}" >> "$tmp"
+	#	[[ "$?" != 0 ]] && echo "Failed, try running as root."
+	#fi
 
 	# make sure directory structure is valid
-	for dir in "${output}/"{"${category}",profiles,eclass,metadata}; do
-		if [[ ! -d "$dir" ]]; then
-			mkdir -p "$dir" || exit 1
-		fi
-	done
+	#for dir in "${output}/"{"${category}",profiles,eclass,metadata}; do
+	#	if [[ ! -d "$dir" ]]; then
+	#		mkdir -p "$dir" || exit 1
+	#	fi
+	#done
 
 	# delete old packages
 	while read package; do
 		rm -rv "${package}"
 	done < <(find "${output}/${category}" -mindepth 1 -maxdepth 1)
-
-	# repository name
-	tmp="${output}/profiles/repo_name"
-	[[ ! -f "$tmp" ]] \
-		&& echo octave > "$tmp"
-
-	# create octave eclass
-	tmp="${output}/eclass/octave.eclass.new"
-	[[ ! -f "$tmp" || $(md5sum "$tmp" \
-		| cut -d\  -f1) != $(echo -n "$octave_eclass" \
-			| md5sum | cut -d\  -f1) ]] \
-		&& echo -n "$octave_eclass" > "$tmp"
-	
-	# create layout.conf
-	tmp="${output}/metadata/layout.conf"
-	[[ ! -f "$tmp" || $(md5sum "$tmp" \
-		| cut -d\  -f1) != $(echo -n "$layout_conf" \
-			| md5sum | cut -d\  -f1) ]] \
-		&& echo -n "$layout_conf" > "$tmp"
 
 	# create ebuilds
 	for package in $(_ packages); do
