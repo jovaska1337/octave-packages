@@ -23,21 +23,21 @@ latest_only=1
 repositories="/var/db/repos"
 
 # output path
-output="${repositories}/octave"
+output="."
 
 # ebuild category for generated ebuilds
 category="octave-packages"
 
 # "builtin" octave packages (these don't resolve as a dependency)
-declare -a octave_builtin
+declare -A octave_builtin
 # the pkg package manager is built into octave
-octave_builtin+=(pkg)
+octave_builtin[pkg]=""
 # this isn't a package anymore but we can force USE=sundials
-# to have all the ODE solver available for use
-octave_builtin+=(odepkg)
+# to have all the ODE solvers available for use
+octave_builtin[odepkg]="sci-mathematics/octave[sundials]"
 
 # packages to ignore from the repository
-# (ie. ebuilds won't be created for these)
+# (these won't be added to the parsed index)
 declare -a octave_ignore
 # this is already built into octave
 octave_ignore+=(pkg)
@@ -64,11 +64,9 @@ extra_depends[fits]="sci-libs/cfitsio"
 # symbolic is missing version information from the sympy
 # dependency. doesn't work with >=sympy-1.6 at all
 # (this is what you get when the devs use LTS distros)
-extra_depends[symbolic]=">dev-python/sympy-1.6"
-# force USE=sundials to enable all ODE solvers
-extra_depends[odepkg]="sci-mathematics/octave[sundials]"
+extra_depends[symbolic]="<dev-python/sympy-1.6"
 # force USE=opengl to pull in fltk
-extra_depends[image-aquisition]="sci-mathematics/octave[opengl]"
+extra_depends[image-acquisition]="sci-mathematics/octave[opengl]"
 
 # gawk program to parse the index
 read -r -d '' gawk_program << EOF
@@ -91,6 +89,122 @@ read -r -d '' gawk_program << EOF
 	}
 }
 EOF
+
+# trim whitespace from input
+trim() {
+	local out
+	out="$1"
+	out="${out#"${out%%[![:space:]]*}"}"
+	out="${out%"${out##*[![:space:]]}"}"
+	echo "$out"
+}
+
+# does array contain value (check with nameref and
+# indecies to avoid pointless string operations)
+contains() {
+	# reference value in parent scope
+	local -n _array_="$1"
+
+	# local variables
+	local i
+	local j
+
+	# scan array
+	i=0
+	j="${#_array_[@]}"
+	while [[ "$i" -lt "$j" ]]; do
+		[[ "${_array_[$i]}" == "$2" ]] && return 0
+		i=$(($i + 1))
+	done
+
+	# value is not in array
+	return 1
+}
+
+# Lehvenstein distance
+levdist() {
+	# local variables
+	local i
+	local j
+	local m
+	local n
+	local a
+	local b
+	local c
+	local _vec0
+	local _vec1
+	local names
+	local state
+
+	# m & n are shorthands for input lengths
+	m="${#1}"
+	n="${#2}"
+
+	# initialize work vectors
+	_vec0=()
+	_vec1=()
+	names=(_vec0 _vec1)
+	state=1
+	local -n x=_vec0
+	local -n y=_vec1
+	i=0
+	while [[ "$i" -le "$n" ]]; do
+		x+=($i)
+		y+=(0)
+		i=$(($i + 1))
+	done
+
+	# algorithm
+	i=0
+	while [[ "$i" -lt "$m" ]]; do
+		y[0]=$(($i + 1))
+
+		j=0
+		while [[ "$j" -lt "$n" ]]; do
+			a=$((${x[$(($j + 1))]} + 1)) # deletion cost
+			b=$((${y[$j]} + 1))          # insertion cost
+
+			# substitution cost
+			[[ "${1:$i:1}" == "${2:$j:1}" ]] \
+				&& c=${x[$j]} || c=$((${x[$j]} + 1))
+
+			# minimal cost (a = min(a, b, c))
+			[[ $b -lt $a ]] && a=$b
+			[[ $c -lt $a ]] && a=$c
+
+			# set value for next loop
+			y[$(($j + 1))]=$a
+
+			j=$(($j + 1))
+		done
+
+		# swap vectors
+		local -n x="${names[$state]}"
+		state=$((! $state))
+		local -n y="${names[$state]}"
+
+		i=$(($i + 1))
+	done
+
+	# assume distance isn't greater than 255
+	return ${x[-1]}
+}
+
+# longest common prefix length
+lcprefix() {
+	# local variables
+	local i
+	local m
+	local n
+
+	i=0; m="${#1}"; n="${#2}"
+	while [[ "$i" -lt "$m" && "$i" -lt "$n" ]]; do
+		[[ "${1:$i:1}" != "${2:$i:1}" ]] && break
+		i=$(($i + 1))
+	done
+
+	echo "$i"
+}
 
 # object creator
 # FIXME: this code is shit, make it better
@@ -310,11 +424,12 @@ resolve_octave() {
 	# split package name
 	info=($(version_split "$1"))
 
-	# octave builtins
-	for package in "${octave_builtin[@]}"; do
-		[[ "${info[0]}" == "$package" ]] \
-			&& return 0
-	done
+	# octave builtins (with optional dependency information)
+	if [[ " ${!octave_builtin[@]} " =~ " ${info[0]} " ]]; then
+		atom="${octave_builtin[${info[0]}]}"
+		[[ "$atom" ]] && echo "$atom"
+		return 0
+	fi
 
 	# octave itself (is applied implicitly without version)
 	if [[ "${info[0]}" == octave ]]; then
@@ -353,7 +468,7 @@ repository_scan() {
 	local name
 	local pcat
 
-	declare -ga repolist
+	declare -ga repolist=()
 	while read line; do
 		# extract package name and category
 		name="${line##*/}"
@@ -618,8 +733,6 @@ shortest() {
 
 # combine multiple atoms of the same package into the most
 # specific one while considering versions and useflags
-# two atoms may be returned for the same package, if the
-# version range is unable to be combined
 prune_atoms() {
 	# local variables
 	local op
@@ -815,10 +928,90 @@ prune_atoms() {
 	echo "${out[@]}"
 }
 
+# scan repositories for licenses
+license_scan() {
+	# local variables
+	local -A map
+
+	# recurse through all license directories
+	# in each repository (we use hashmap keys
+	# in order to avoid duplicates in the list)
+	while read dir; do
+		while read license; do
+			license="${license##*/}"
+			map["$license"]=""
+		done < <(find "$dir" -type f)
+	done < <(find "${repositories}" -mindepth 2 \
+		-maxdepth 2 -type d -name licenses)
+
+	# this assignment does pointless string ops
+	# but there isn't really a better way of doing it
+	declare -ga licenses=("${!map[@]}")
+}
+
 # find known license(s) in the repositories
 # that best match the input
 find_license() {
-	echo "$1"
+	# local variables
+	local i
+	local j
+	local x
+	local y
+	local z
+	local tmp
+	local part
+	local parts
+	local filtered
+
+	# split by "and" (used by the octave repository
+	# as a separator in the license field)
+	part="${1}and" 
+	parts=()
+	while [[ "$part" ]]; do
+		tmp="$(trim "${part%%and*}")"
+		parts+=("${tmp// /-}")
+		part="${part#*and}"
+	done
+
+	echo "${parts[@]}"
+
+	# process each part
+	# (this doesn't really work properly)
+#	for part in "${parts[@]}"; do
+#		# find licenses with at least 3
+#		# character common prefix match
+#		i=0; j="${#licenses[@]}"; filtered=()
+#		while [[ "$i" -lt "$j" ]]; do
+#			tmp="${licenses[$i]}"
+#
+#			# longest common prefix
+#			[[ $(lcprefix "$part" "$tmp") -ge 4 ]] \
+#				&& filtered+=("$tmp")
+#
+#			i=$(($i + 1))
+#		done
+#
+#		# select license from the filter with the
+#		# smallest lehvenstein distance
+#		i=0; j="${#filtered}"; x=""; y=255
+#		while [[ "$i" -lt "$j" ]]; do
+#			tmp="${filtered[$i]}"
+#			
+#			# distance
+#			levdist "$part" "$tmp"
+#			z=$?
+#
+#			# keep track of best match
+#			if [[ "$z" -lt "$y" ]]; then
+#				x="$tmp"
+#				y="$z"
+#			fi
+#
+#			i=$(($i + 1))
+#		done
+#
+#		echo "$part -> $x $y"
+#	done
 }
 
 # main function
@@ -860,8 +1053,7 @@ main() {
 		package="${fields[0]}"
 
 		# should we ignore this package
-		[[ " ${ignore_packages[@]} " =~ " $package " ]] \
-			&& continue
+		contains octave_ignore "$package" && continue
 
 		# third field is the value to be assigned
 		value="${fields[2]}"
@@ -918,38 +1110,51 @@ main() {
 		return 1
 	fi
 
+	# cache available licenses
+#	echo -n "Caching licenses ..."
+#	license_scan
+#	if [[ "${#licenses[@]}" > 0 ]]; then
+#		echo -e "\b\b\bdone. (${#licenses[@]} licenses)"
+#	else
+#		# this isn't a hard error, we just fall back
+#		# to setting LICENSE to whatever the index
+#		# specifies directly
+#		echo -e "\b\b\bfailed. (no licenses found)"
+#	fi
+
 	# add to /etc/portage/repos.conf/
-	#tmp="/etc/portage/repos.conf/octave.conf"
-	#if [[ -d "${tmp%/*}" ]]; then
-	#	if [[ ! -f "$tmp" || $(md5sum "$tmp" \
-	#		| cut -d\  -f1) != $(echo -n "$repo_conf" \
-	#			| md5sum | cut -d\  -f1) ]]; then
-	#		echo "Adding/modifying repository config..."
-	#		echo -n "$repo_conf" > "$tmp"
-	#		[[ "$?" != 0 ]] && echo "Failed, try running as root."
-	#	fi
-	#fi
+#	tmp="/etc/portage/repos.conf/octave.conf"
+#	if [[ -d "${tmp%/*}" ]]; then
+#		if [[ ! -f "$tmp" || $(md5sum "$tmp" \
+#			| cut -d\  -f1) != $(echo -n "$repo_conf" \
+#				| md5sum | cut -d\  -f1) ]]; then
+#			echo "Adding/modifying repository config..."
+#			echo -n "$repo_conf" > "$tmp"
+#			[[ "$?" != 0 ]] && echo "Failed, try running as root."
+#		fi
+#	fi
 
 	# add category to /etc/portage/categories
-	#tmp="/etc/portage/categories"
-	#grep "^${category}\$" "$tmp" &>/dev/null
-	#if [[ "$?" != 0 ]]; then
-	#	echo "Adding ${category} to ${tmp}..."
-	#	echo "${category}" >> "$tmp"
-	#	[[ "$?" != 0 ]] && echo "Failed, try running as root."
-	#fi
+#	tmp="/etc/portage/categories"
+#	grep "^${category}\$" "$tmp" &>/dev/null
+#	if [[ "$?" != 0 ]]; then
+#		echo "Adding ${category} to ${tmp}..."
+#		echo "${category}" >> "$tmp"
+#		[[ "$?" != 0 ]] && echo "Failed, try running as root."
+#	fi
 
 	# make sure directory structure is valid
-	#for dir in "${output}/"{"${category}",profiles,eclass,metadata}; do
-	#	if [[ ! -d "$dir" ]]; then
-	#		mkdir -p "$dir" || exit 1
-	#	fi
-	#done
+#	for dir in "${output}/"{"${category}",profiles,eclass,metadata}; do
+#		if [[ ! -d "$dir" ]]; then
+#			mkdir -p "$dir" || exit 1
+#		fi
+#	done
 
 	# delete old packages
+	echo "Removing old packages ..."
 	while read package; do
-		rm -rv "${package}"
-	done < <(find "${output}/${category}" -mindepth 1 -maxdepth 1)
+		rm -r "${package}"
+	done < <(find "${output}/${category}" -mindepth 1 -maxdepth 1 -type d)
 
 	# create ebuilds
 	for package in $(_ packages); do
@@ -989,6 +1194,7 @@ main() {
 			self="${package}.versions@${i}"
 
 			ver=$(_ packages "${self}.id")
+			echo " Version '${ver}'..."
 
 			# convert dev to 9999
 			[[ "$ver" == dev ]] && ver=9999
@@ -1005,12 +1211,9 @@ main() {
 
 			url=$(_ packages "${self}.url")
 
-			echo " Version '$([[ "$ver" == 9999 ]] \
-				&& echo dev || echo "$ver")'..."
-
-			# resolve dependencies
+			# resolve dependencies (always depend on octave)
 			echo " Resolving dependencies..."
-			deps=()
+			deps=( sci-mathematics/octave )
 
 			# octave package dependencies + octave
 			for j in $(_ packages "${self}.depends"); do
@@ -1082,6 +1285,7 @@ main() {
 
 			# add extra hard coded dependencies
 			for dep in "${extra_depends[$package]}"; do
+				[[ "$dep" ]] || continue
 				deps+=("$dep")
 			done
 
@@ -1113,11 +1317,7 @@ main() {
 			echo "DESCRIPTION=\"${desc}\"" >> "$target"
 			echo "LICENSE=\"${license}\"" >> "$target"
 			echo -e "HOMEPAGE=\"${home}\"\n" >> "$target"
-			echo -e "SRC_URI=\"\n${url} -> \${P}.tar.gz\"" >> "$target"
-			echo "RESTRICT=\"mirror\"" >> "$target"
-			[[ "$ver" == 9999 ]] \
-				&& echo -e "KEYWORDS=\"\"\n" >> "$target" \
-				|| echo -e "KEYWORDS=\"~amd64 ~x86\"\n" >> "$target"
+			echo -e "SRC_URI=\"\n\t${url} -> \${P}.tar.gz\"" >> "$target"
 			echo -n "RDEPEND=\"" >> "$target"
 			for atom in "${deps[@]}"; do
 				echo -en "\n\t${atom}" >> "$target"
