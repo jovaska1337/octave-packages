@@ -10,8 +10,11 @@
 # A helper eclass for installing GNU Octave packages through
 # portage. Based on g-octave.eclass and the octave forge Makefile.
 
-# no slotting
-SLOT=0
+# no slotting for octave packages
+SLOT="0"
+
+# gentoo mirrors won't have the package files
+RESTRICT="mirror"
 
 # keywording
 if [[ "$PV" == 9999 ]]; then
@@ -61,6 +64,7 @@ _octave_env() {
 
 		# include path fixes, add per package as trying to automate
 		# this will cause way more pain than it actually resolves
+		# (this is also easier than patching configure/Makfile)
 		local include=( fltk )
 
 		# generate CPATH
